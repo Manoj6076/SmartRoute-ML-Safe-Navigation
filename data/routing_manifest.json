@@ -1,0 +1,14 @@
+{
+  "project": "SmartRoute",
+  "data_area": "Bengaluru, Karnataka, India",
+  "node_count": 155810,
+  "exported_edge_count": 394495,
+  "graph_edge_count": 394495,
+  "matched_edge_count": 394495,
+  "unmatched_edge_count": 0,
+  "feature_match_pct": 100.0,
+  "node_file": "nodes.csv.gz",
+  "edge_file": "edges.csv.gz",
+  "coordinates": "longitude/latitude",
+  "note": "Road health, safety, traffic and risk fields are modelled features, not guaranteed live conditions."
+}
