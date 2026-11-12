@@ -5,68 +5,122 @@ import math
 import networkx as nx
 import numpy as np
 import pandas as pd
-from geopy.geocoders import Nominatim
+from geopy.geocoders import Nominatim, Photon
 
 
-# Bengaluru coverage boundary for this prototype.
+# ============================================================================
+# BENGALURU COVERAGE BOUNDARY
+# ============================================================================
+
 LAT_MIN, LAT_MAX = 12.70, 13.25
 LON_MIN, LON_MAX = 77.30, 77.85
 
 
+# ============================================================================
+# GEOCODING — NOMINATIM PRIMARY + PHOTON BACKUP
+# ============================================================================
+
 def geocode_location(query):
-    """Resolve a user-entered location within the Bengaluru coverage area."""
+    """Resolve Bengaluru locations using Nominatim with Photon fallback."""
+
     query = str(query).strip()
 
     if not query:
         raise ValueError("Enter a source or destination.")
 
-    geocoder = Nominatim(
-        user_agent="SmartRouteSafeNavigation/1.0"
+    search_query = f"{query}, Bengaluru, Karnataka, India"
+
+    errors = []
+
+    providers = [
+        (
+            "Nominatim",
+            Nominatim(
+                user_agent="SmartRouteSafeNavigation/2.0",
+                timeout=12
+            )
+        ),
+        (
+            "Photon",
+            Photon(
+                user_agent="SmartRouteSafeNavigation/2.0",
+                timeout=15
+            )
+        )
+    ]
+
+    for provider_name, geocoder in providers:
+
+        try:
+
+            if provider_name == "Nominatim":
+
+                result = geocoder.geocode(
+                    search_query,
+                    exactly_one=True,
+                    country_codes="in",
+                    viewbox=[
+                        (LAT_MAX, LON_MIN),
+                        (LAT_MIN, LON_MAX)
+                    ],
+                    bounded=True
+                )
+
+            else:
+
+                result = geocoder.geocode(
+                    search_query,
+                    exactly_one=True
+                )
+
+            if result is None:
+
+                errors.append(
+                    f"{provider_name}: Location not found."
+                )
+
+                continue
+
+            lat = float(result.latitude)
+            lon = float(result.longitude)
+
+            # Validate Bengaluru coverage.
+
+            if not (
+                LAT_MIN <= lat <= LAT_MAX
+                and LON_MIN <= lon <= LON_MAX
+            ):
+
+                errors.append(
+                    f"{provider_name}: Location outside Bengaluru coverage."
+                )
+
+                continue
+
+            return {
+                "query": query,
+                "address": result.address,
+                "lat": lat,
+                "lon": lon,
+                "geocoding_provider": provider_name
+            }
+
+        except Exception as exc:
+
+            errors.append(
+                f"{provider_name}: {type(exc).__name__}: {exc}"
+            )
+
+    raise RuntimeError(
+        "Unable to resolve this location using available geocoding "
+        "services. Check your internet connection and try again. "
+        + " | ".join(errors)
     )
 
-    try:
-        result = geocoder.geocode(
-            f"{query}, Bengaluru, Karnataka, India",
-            exactly_one=True,
-            country_codes="in",
-            viewbox=[
-                (LAT_MAX, LON_MIN),
-                (LAT_MIN, LON_MAX)
-            ],
-            bounded=True,
-            timeout=15
-        )
-    except Exception as exc:
-        raise RuntimeError(
-            "Location search could not reach the geocoding service. "
-            "Check your internet connection and try again later."
-        ) from exc
 
-    if result is None:
-        raise ValueError(
-            f"Could not find '{query}' within the supported Bengaluru area. "
-            "Try a more specific locality or landmark."
-        )
-
-    lat = float(result.latitude)
-    lon = float(result.longitude)
-
-    if not (
-        LAT_MIN <= lat <= LAT_MAX
-        and LON_MIN <= lon <= LON_MAX
-    ):
-        raise ValueError(
-            f"'{query}' resolved outside the supported Bengaluru area. "
-            "Please enter a location within Bengaluru."
-        )
-
-    return {
-        "query": query,
-        "address": result.address,
-        "lat": lat,
-        "lon": lon
-    }
-
+# ============================================================================
+# LOAD ROUTING DATA
+# ============================================================================
 
 def load_routing_data(data_dir):
     """
@@ -75,11 +129,14 @@ def load_routing_data(data_dir):
     Parallel edges between the same pair of nodes are reduced to the
     shortest usable edge to keep the in-memory graph manageable.
     """
+
     data_dir = Path(data_dir)
+
     nodes_path = data_dir / "nodes.csv.gz"
     edges_path = data_dir / "edges.csv.gz"
 
     if not nodes_path.exists() or not edges_path.exists():
+
         raise FileNotFoundError(
             "Compact routing files are missing. Run Section 12.5."
         )
@@ -87,13 +144,26 @@ def load_routing_data(data_dir):
     nodes = pd.read_csv(nodes_path)
 
     required_node_columns = {"node_id", "lat", "lon"}
+
     if not required_node_columns.issubset(nodes.columns):
-        raise ValueError("The node file has an invalid schema.")
+
+        raise ValueError(
+            "The node file has an invalid schema."
+        )
 
     nodes["node_id"] = nodes["node_id"].astype(str)
-    nodes["lat"] = pd.to_numeric(nodes["lat"], errors="coerce")
-    nodes["lon"] = pd.to_numeric(nodes["lon"], errors="coerce")
-    nodes = nodes.dropna(subset=["node_id", "lat", "lon"])
+
+    nodes["lat"] = pd.to_numeric(
+        nodes["lat"], errors="coerce"
+    )
+
+    nodes["lon"] = pd.to_numeric(
+        nodes["lon"], errors="coerce"
+    )
+
+    nodes = nodes.dropna(
+        subset=["node_id", "lat", "lon"]
+    )
 
     node_coords = {
         row.node_id: (float(row.lat), float(row.lon))
@@ -101,12 +171,20 @@ def load_routing_data(data_dir):
     }
 
     # Arrays accelerate nearest-road-node lookup.
-    node_ids = np.asarray(list(node_coords.keys()), dtype=object)
-    node_lats = np.asarray(
-        [node_coords[n][0] for n in node_ids], dtype=float
+
+    node_ids = np.asarray(
+        list(node_coords.keys()),
+        dtype=object
     )
+
+    node_lats = np.asarray(
+        [node_coords[n][0] for n in node_ids],
+        dtype=float
+    )
+
     node_lons = np.asarray(
-        [node_coords[n][1] for n in node_ids], dtype=float
+        [node_coords[n][1] for n in node_ids],
+        dtype=float
     )
 
     node_index = {
@@ -117,12 +195,12 @@ def load_routing_data(data_dir):
 
     graph = nx.DiGraph()
 
-    # Add nodes first so isolated or currently unusable edges do not
-    # remove their coordinate records.
     graph.add_nodes_from(node_coords.keys())
 
     usecols = [
-        "u", "v", "length_m",
+        "u",
+        "v",
+        "length_m",
         "road_health_feature",
         "day_safety_feature",
         "night_safety_feature",
@@ -135,25 +213,46 @@ def load_routing_data(data_dir):
     ]
 
     # Read chunks to avoid holding the complete CSV in memory.
+
     for chunk in pd.read_csv(
         edges_path,
         compression="gzip",
         usecols=lambda c: c in usecols,
         chunksize=40000
     ):
+
         for col in usecols:
+
             if col not in chunk.columns:
+
                 if col in ("u", "v"):
-                    raise ValueError(f"Edge file is missing {col}.")
+
+                    raise ValueError(
+                        f"Edge file is missing {col}."
+                    )
+
                 chunk[col] = np.nan
 
         for col in usecols[2:]:
-            chunk[col] = pd.to_numeric(chunk[col], errors="coerce")
 
-        chunk = chunk.dropna(subset=["u", "v", "length_m"])
-        chunk = chunk[chunk["length_m"] > 0]
+            chunk[col] = pd.to_numeric(
+                chunk[col],
+                errors="coerce"
+            )
 
-        for row in chunk.itertuples(index=False, name=None):
+        chunk = chunk.dropna(
+            subset=["u", "v", "length_m"]
+        )
+
+        chunk = chunk[
+            chunk["length_m"] > 0
+        ]
+
+        for row in chunk.itertuples(
+            index=False,
+            name=None
+        ):
+
             (
                 u, v, length_m,
                 health, day_safety, night_safety,
@@ -169,24 +268,53 @@ def load_routing_data(data_dir):
 
             length_m = float(length_m)
 
-            health = float(health) if pd.notna(health) else 50.0
+            health = (
+                float(health)
+                if pd.notna(health)
+                else 50.0
+            )
+
             day_safety = (
-                float(day_safety) if pd.notna(day_safety) else 50.0
+                float(day_safety)
+                if pd.notna(day_safety)
+                else 50.0
             )
+
             night_safety = (
-                float(night_safety) if pd.notna(night_safety) else 50.0
+                float(night_safety)
+                if pd.notna(night_safety)
+                else 50.0
             )
+
             health_risk = (
                 float(health_risk)
-                if pd.notna(health_risk) else 100.0 - health
+                if pd.notna(health_risk)
+                else 100.0 - health
             )
+
             traffic_risk = (
                 float(traffic_risk)
-                if pd.notna(traffic_risk) else 50.0
+                if pd.notna(traffic_risk)
+                else 50.0
             )
-            time_risk = float(time_risk) if pd.notna(time_risk) else 50.0
-            ml_risk = float(ml_risk) if pd.notna(ml_risk) else 50.0
-            speed = float(speed) if pd.notna(speed) else 20.0
+
+            time_risk = (
+                float(time_risk)
+                if pd.notna(time_risk)
+                else 50.0
+            )
+
+            ml_risk = (
+                float(ml_risk)
+                if pd.notna(ml_risk)
+                else 50.0
+            )
+
+            speed = (
+                float(speed)
+                if pd.notna(speed)
+                else 20.0
+            )
 
             health = float(np.clip(health, 0, 100))
             day_safety = float(np.clip(day_safety, 0, 100))
@@ -197,12 +325,15 @@ def load_routing_data(data_dir):
             ml_risk = float(np.clip(ml_risk, 0, 100))
             speed = float(np.clip(speed, 5, 100))
 
-            # Keep the shortest parallel edge for this directed node pair.
+            # Keep the shortest parallel edge.
+
             if graph.has_edge(u, v):
+
                 if graph[u][v]["length_m"] <= length_m:
                     continue
 
-            # Distance, balanced-risk, and safety-oriented route costs.
+            # Distance, balanced-risk and safety-oriented route costs.
+
             balanced_factor = (
                 1.0
                 + 0.25 * health_risk / 100
@@ -222,7 +353,8 @@ def load_routing_data(data_dir):
             )
 
             graph.add_edge(
-                u, v,
+                u,
+                v,
                 length_m=length_m,
                 road_health=health,
                 day_safety=day_safety,
@@ -238,13 +370,21 @@ def load_routing_data(data_dir):
             )
 
     if graph.number_of_edges() == 0:
-        raise ValueError("No usable routing edges were loaded.")
+
+        raise ValueError(
+            "No usable routing edges were loaded."
+        )
 
     return graph, node_coords, node_index
 
 
+# ============================================================================
+# NEAREST ROAD NETWORK NODE
+# ============================================================================
+
 def nearest_node(lat, lon, node_index):
     """Find the nearest road-network node using vectorized coordinates."""
+
     lat = float(lat)
     lon = float(lon)
 
@@ -252,15 +392,28 @@ def nearest_node(lat, lon, node_index):
     lons = node_index["lons"]
 
     # Approximate local distance in kilometres.
+
     dy = (lats - lat) * 111.0
-    dx = (lons - lon) * 111.0 * math.cos(math.radians(lat))
+
+    dx = (
+        (lons - lon)
+        * 111.0
+        * math.cos(math.radians(lat))
+    )
+
     distances_sq = dx * dx + dy * dy
 
     index = int(np.argmin(distances_sq))
-    return str(node_index["ids"][index]), float(
-        math.sqrt(distances_sq[index])
+
+    return (
+        str(node_index["ids"][index]),
+        float(math.sqrt(distances_sq[index]))
     )
 
+
+# ============================================================================
+# FIND ALTERNATIVE ROUTES
+# ============================================================================
 
 def find_route_candidates(
     graph,
@@ -277,17 +430,27 @@ def find_route_candidates(
     Each location dict must contain 'lat' and 'lon'.
     Route paths are generated using different edge-cost strategies.
     """
+
     if period not in ("Daytime", "Nighttime"):
-        raise ValueError("period must be Daytime or Nighttime.")
+
+        raise ValueError(
+            "period must be Daytime or Nighttime."
+        )
 
     source_node, source_offset_km = nearest_node(
-        source["lat"], source["lon"], node_index
+        source["lat"],
+        source["lon"],
+        node_index
     )
+
     destination_node, destination_offset_km = nearest_node(
-        destination["lat"], destination["lon"], node_index
+        destination["lat"],
+        destination["lon"],
+        node_index
     )
 
     if source_node == destination_node:
+
         raise ValueError(
             "Source and destination resolve to the same nearby road node. "
             "Please choose more distinct locations."
@@ -300,13 +463,19 @@ def find_route_candidates(
     ]
 
     selected_safety_key = (
-        "day_safety" if period == "Daytime" else "night_safety"
+        "day_safety"
+        if period == "Daytime"
+        else "night_safety"
     )
 
-    # Safety-oriented route cost must reflect the selected time period.
+    # Nighttime safety cost must reflect nighttime conditions.
+
     if period == "Nighttime":
+
         for _, _, data in graph.edges(data=True):
+
             safety_risk = 100.0 - data["night_safety"]
+
             data["safety_cost"] = data["length_m"] * (
                 1.0
                 + 0.15 * data["health_risk"] / 100
@@ -320,7 +489,9 @@ def find_route_candidates(
     seen_paths = set()
 
     for label, weight in strategies:
+
         try:
+
             path = nx.shortest_path(
                 graph,
                 source=source_node,
@@ -328,7 +499,9 @@ def find_route_candidates(
                 weight=weight,
                 method="dijkstra"
             )
+
         except (nx.NetworkXNoPath, nx.NodeNotFound):
+
             continue
 
         path_key = tuple(path)
@@ -337,105 +510,199 @@ def find_route_candidates(
             continue
 
         seen_paths.add(path_key)
-        candidate_paths.append((label, path))
+
+        candidate_paths.append(
+            (label, path)
+        )
 
         if len(candidate_paths) >= max_routes:
             break
 
     if not candidate_paths:
+
         raise ValueError(
             "No connected road route was found between these locations."
         )
 
     results = []
 
-    for index, (strategy, path) in enumerate(candidate_paths, start=1):
+    # Calculate route metrics.
+
+    for index, (strategy, path) in enumerate(
+        candidate_paths,
+        start=1
+    ):
+
         edge_rows = []
 
         for u, v in zip(path[:-1], path[1:]):
-            edge_rows.append(graph[u][v])
+
+            edge_rows.append(
+                graph[u][v]
+            )
 
         if not edge_rows:
             continue
 
         lengths = np.asarray(
-            [edge["length_m"] for edge in edge_rows], dtype=float
+            [edge["length_m"] for edge in edge_rows],
+            dtype=float
         )
+
         total_length = float(lengths.sum())
+
         weights = lengths / max(total_length, 1e-9)
 
         def weighted_mean(key):
+
             values = np.asarray(
-                [edge[key] for edge in edge_rows], dtype=float
+                [edge[key] for edge in edge_rows],
+                dtype=float
             )
-            return float(np.average(values, weights=weights))
+
+            return float(
+                np.average(values, weights=weights)
+            )
 
         road_health = weighted_mean("road_health")
-        safety = weighted_mean(selected_safety_key)
-        traffic_risk = weighted_mean("traffic_risk")
-        ml_risk = weighted_mean("ml_risk")
+
+        safety = weighted_mean(
+            selected_safety_key
+        )
+
+        traffic_risk = weighted_mean(
+            "traffic_risk"
+        )
+
+        ml_risk = weighted_mean(
+            "ml_risk"
+        )
+
+        # Estimated travel time.
 
         estimated_time = sum(
             (edge["length_m"] / 1000.0)
             / max(edge["speed_kmph"], 5.0)
             * 60.0
-            * (1.0 + edge["traffic_risk"] / 100.0 * 0.35)
+            * (
+                1.0
+                + edge["traffic_risk"] / 100.0 * 0.35
+            )
             for edge in edge_rows
         )
 
+        # Actual road-network coordinates.
+
         route_coordinates = [
-            [node_coords[node][0], node_coords[node][1]]
+            [
+                node_coords[node][0],
+                node_coords[node][1]
+            ]
             for node in path
             if node in node_coords
         ]
 
         results.append({
+
             "route_id": f"dynamic_{index}",
+
             "route_number": index,
+
             "strategy": strategy,
+
             "distance_km": total_length / 1000.0,
+
             "estimated_time_min": float(estimated_time),
+
             "road_health_pct": road_health,
+
             "day_safety_pct": weighted_mean("day_safety"),
+
             "night_safety_pct": weighted_mean("night_safety"),
+
             "selected_safety_pct": safety,
+
             "traffic_risk_pct": traffic_risk,
+
             "ml_risk_proxy_pct": ml_risk,
+
             "segment_count": len(edge_rows),
+
             "coordinates": route_coordinates,
+
             "source_node": source_node,
+
             "destination_node": destination_node,
+
             "source_snap_distance_km": source_offset_km,
+
             "destination_snap_distance_km": destination_offset_km
+
         })
 
     if not results:
-        raise ValueError("No valid route candidates were generated.")
+
+        raise ValueError(
+            "No valid route candidates were generated."
+        )
 
     # Apply the project's configured multi-factor weights.
-    fastest_time = min(r["estimated_time_min"] for r in results)
+
+    fastest_time = min(
+        r["estimated_time_min"]
+        for r in results
+    )
 
     for route in results:
+
         travel_time_score = (
-            100.0 * fastest_time / max(route["estimated_time_min"], 1e-9)
+            100.0
+            * fastest_time
+            / max(route["estimated_time_min"], 1e-9)
         )
-        traffic_score = 100.0 - route["traffic_risk_pct"]
-        ml_score = 100.0 - route["ml_risk_proxy_pct"]
+
+        traffic_score = (
+            100.0 - route["traffic_risk_pct"]
+        )
+
+        ml_score = (
+            100.0 - route["ml_risk_proxy_pct"]
+        )
 
         route["overall_score"] = (
+
             0.25 * route["road_health_pct"]
+
             + 0.30 * route["selected_safety_pct"]
+
             + 0.20 * travel_time_score
+
             + 0.10 * traffic_score
+
             + 0.15 * ml_score
+
         )
 
-    results.sort(key=lambda item: item["overall_score"], reverse=True)
+    # Rank routes by overall score.
 
-    for rank, route in enumerate(results, start=1):
+    results.sort(
+        key=lambda item: item["overall_score"],
+        reverse=True
+    )
+
+    for rank, route in enumerate(
+        results,
+        start=1
+    ):
+
         route["rank"] = rank
+
         route["recommendation"] = (
-            "Recommended route" if rank == 1 else f"Alternative {rank}"
+
+            "Recommended route"
+            if rank == 1
+            else f"Alternative {rank}"
+
         )
 
     return results
