@@ -1,7 +1,7 @@
 
 from pathlib import Path
 import json
-import math
+import html
 
 import folium
 import pandas as pd
@@ -14,9 +14,9 @@ from routing_engine import (
     find_route_candidates,
 )
 
-# ============================================================================
+# ============================================================
 # CONFIGURATION
-# ============================================================================
+# ============================================================
 
 APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "data"
@@ -29,9 +29,9 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# ============================================================================
+# ============================================================
 # STYLE
-# ============================================================================
+# ============================================================
 
 st.markdown("""
 <style>
@@ -83,33 +83,38 @@ st.caption(
 
 st.divider()
 
-# ============================================================================
-# LOAD ROUTING NETWORK ONCE PER APP PROCESS
-# ============================================================================
+# ============================================================
+# LOAD ROUTING NETWORK
+# ============================================================
 
 @st.cache_resource(show_spinner="Loading Bengaluru road network...")
 def get_routing_network(data_directory):
     return load_routing_data(Path(data_directory))
 
 
-# ============================================================================
+# ============================================================
 # CACHED GEOCODING
-# ============================================================================
+# ============================================================
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def cached_geocode_location(query):
     """
     Cache successful location lookups for 24 hours.
 
-    The actual geocoding is handled by routing_engine.py,
-    which uses Nominatim with Photon as a backup.
+    Uses the updated routing_engine.py, including
+    online geocoding and supported local fallbacks.
     """
-    return geocode_location(query.strip())
+    cleaned_query = str(query).strip()
+
+    if not cleaned_query:
+        raise ValueError("Enter a source or destination.")
+
+    return geocode_location(cleaned_query)
 
 
-# ============================================================================
-# HELPERS
-# ============================================================================
+# ============================================================
+# HELPER FUNCTIONS
+# ============================================================
 
 def format_number(value, decimals=1):
     try:
@@ -123,7 +128,7 @@ def format_pct(value):
 
 
 def load_example_routes():
-    """Load existing route examples without requiring them for dynamic routing."""
+    """Load existing route examples if available."""
 
     if not ROUTES_PATH.exists():
         return []
@@ -145,8 +150,12 @@ def load_example_routes():
     return []
 
 
+# ============================================================
+# INTERACTIVE ROUTE MAP
+# ============================================================
+
 def make_route_map(routes, source, destination):
-    """Build an interactive Folium map using calculated route paths."""
+    """Create an interactive Folium map."""
 
     center = [
         (source["lat"] + destination["lat"]) / 2,
@@ -194,12 +203,13 @@ def make_route_map(routes, source, destination):
         [source["lat"], source["lon"]],
         tooltip="Source: " + source["query"],
         popup=folium.Popup(
-            "<b>START</b><br>" + source["address"],
+            "<b>START</b><br>"
+            + html.escape(str(source["address"])),
             max_width=320,
         ),
         icon=folium.Icon(
             color="blue",
-            icon="play"
+            icon="play",
         ),
     ).add_to(fmap)
 
@@ -209,12 +219,13 @@ def make_route_map(routes, source, destination):
         [destination["lat"], destination["lon"]],
         tooltip="Destination: " + destination["query"],
         popup=folium.Popup(
-            "<b>DESTINATION</b><br>" + destination["address"],
+            "<b>DESTINATION</b><br>"
+            + html.escape(str(destination["address"])),
             max_width=320,
         ),
         icon=folium.Icon(
             color="darkred",
-            icon="flag"
+            icon="flag",
         ),
     ).add_to(fmap)
 
@@ -227,7 +238,7 @@ def make_route_map(routes, source, destination):
 
         fmap.fit_bounds(
             all_points,
-            padding=(30, 30)
+            padding=(30, 30),
         )
 
     # Map legend
@@ -261,6 +272,10 @@ def make_route_map(routes, source, destination):
     return fmap
 
 
+# ============================================================
+# ROUTE INFORMATION CARDS
+# ============================================================
+
 def show_route_card(route, selected_period, recommended=False):
 
     heading = (
@@ -271,7 +286,7 @@ def show_route_card(route, selected_period, recommended=False):
 
     st.markdown(
         '<div class="route-card">',
-        unsafe_allow_html=True
+        unsafe_allow_html=True,
     )
 
     st.markdown(
@@ -299,7 +314,7 @@ def show_route_card(route, selected_period, recommended=False):
 
     c4.metric(
         "Road health",
-        format_pct(route.get("road_health_pct"))
+        format_pct(route.get("road_health_pct")),
     )
 
     c5.metric(
@@ -325,9 +340,9 @@ def show_route_card(route, selected_period, recommended=False):
     st.markdown("</div>", unsafe_allow_html=True)
 
 
-# ============================================================================
+# ============================================================
 # SIDEBAR — JOURNEY INPUTS
-# ============================================================================
+# ============================================================
 
 with st.sidebar:
 
@@ -341,11 +356,13 @@ with st.sidebar:
 
         source_query = st.text_input(
             "Source location",
+            value="Majestic",
             placeholder="e.g. Majestic",
         )
 
         destination_query = st.text_input(
             "Destination",
+            value="Indiranagar",
             placeholder="e.g. Whitefield",
         )
 
@@ -367,27 +384,37 @@ with st.sidebar:
 
     st.write(
         "Majestic, Indiranagar, Koramangala, "
-        "Whitefield, Electronic City"
+        "Whitefield, Electronic City, MG Road, HSR Layout"
     )
 
+    if st.button(
+        "Clear cached location lookups",
+        use_container_width=True,
+    ):
+        cached_geocode_location.clear()
+        st.success(
+            "Cached location lookups cleared. Submit your journey again."
+        )
+
     st.caption(
-        "Location search uses Nominatim with Photon as a backup. "
-        "Internet access is required. Successful lookups are "
+        "Location search tries online geocoding first and uses saved "
+        "approximate coordinates for supported Bengaluru areas when "
+        "online services are unavailable. Successful lookups are "
         "cached for 24 hours."
     )
 
 
-# ============================================================================
+# ============================================================
 # CALCULATE ROUTES
-# ============================================================================
+# ============================================================
 
 if submitted:
 
-    # Clear previous result before starting a new search.
+    # Remove previous result before a new calculation.
 
     st.session_state.pop(
         "smartroute_result",
-        None
+        None,
     )
 
     if not source_query.strip() or not destination_query.strip():
@@ -410,23 +437,25 @@ if submitted:
                 "Resolving locations and calculating routes..."
             ):
 
-                # Resolve source and destination.
+                # Resolve source location.
 
                 source_location = cached_geocode_location(
                     source_query
                 )
 
+                # Resolve destination location.
+
                 destination_location = cached_geocode_location(
                     destination_query
                 )
 
-                # Load graph and coordinate index.
+                # Load road network.
 
                 graph, node_coords, node_index = get_routing_network(
                     str(DATA_DIR)
                 )
 
-                # Generate actual road-network routes.
+                # Generate alternative routes.
 
                 calculated_routes = find_route_candidates(
                     graph=graph,
@@ -465,25 +494,41 @@ if submitted:
             )
 
             st.info(
-                "Check that data/nodes.csv.gz and "
-                "data/edges.csv.gz exist in your project."
+                "Your GitHub repository must contain both "
+                "data/nodes.csv.gz and data/edges.csv.gz. "
+                "Check the spelling, capitalization and folder location."
+            )
+
+        except RuntimeError as exc:
+
+            st.error(
+                f"Location search failed: {exc}"
+            )
+
+            st.info(
+                "For offline fallback, try a supported Bengaluru area: "
+                "Majestic, Indiranagar, Koramangala, Whitefield, "
+                "Electronic City, MG Road or HSR Layout."
             )
 
         except Exception as exc:
 
             st.error(
-                f"Unable to calculate routes: {exc}"
+                f"Unable to calculate routes: "
+                f"{type(exc).__name__}: {exc}"
             )
 
             st.info(
-                "Check your internet connection, geocoding "
-                "services, and road-network connectivity."
+                "Check the routing dataset, Python dependencies, "
+                "and road-network connectivity. If this continues, "
+                "open Manage app → Logs in Streamlit Cloud and inspect "
+                "the first traceback."
             )
 
 
-# ============================================================================
-# DISPLAY SAVED RESULT
-# ============================================================================
+# ============================================================
+# DISPLAY SAVED RESULTS
+# ============================================================
 
 result = st.session_state.get(
     "smartroute_result"
@@ -508,23 +553,40 @@ if result:
     with left:
 
         st.markdown("**SOURCE**")
-
         st.write(source["address"])
 
     with right:
 
         st.markdown("**DESTINATION**")
-
         st.write(destination["address"])
 
-    # Provider details
+    # Geocoding provider information
+
+    source_provider = source.get(
+        "geocoding_provider",
+        "Unknown",
+    )
+
+    destination_provider = destination.get(
+        "geocoding_provider",
+        "Unknown",
+    )
 
     st.caption(
-        f"Source provider: "
-        f"{source.get('geocoding_provider', 'Unknown')} | "
-        f"Destination provider: "
-        f"{destination.get('geocoding_provider', 'Unknown')}"
+        f"Source provider: {source_provider} | "
+        f"Destination provider: {destination_provider}"
     )
+
+    if (
+        source_provider == "Local Bengaluru fallback"
+        or destination_provider == "Local Bengaluru fallback"
+    ):
+
+        st.warning(
+            "At least one location uses an approximate saved Bengaluru "
+            "coordinate because online geocoding was unavailable. "
+            "Verify the start/end points on the map before using the route."
+        )
 
     st.caption(
         "Routes are snapped to the nearest road-network nodes. "
@@ -533,7 +595,9 @@ if result:
 
     first = routes[0]
 
-    # Recommended route
+    # ========================================================
+    # RECOMMENDED ROUTE
+    # ========================================================
 
     st.markdown("## Recommended route")
 
@@ -568,7 +632,9 @@ if result:
         ),
     )
 
-    # Route map
+    # ========================================================
+    # ROUTE MAP
+    # ========================================================
 
     st.markdown("## Bengaluru route map")
 
@@ -581,7 +647,7 @@ if result:
     fmap = make_route_map(
         routes,
         source,
-        destination
+        destination,
     )
 
     st_folium(
@@ -592,7 +658,9 @@ if result:
         key="smartroute_dynamic_map",
     )
 
-    # Alternative route cards
+    # ========================================================
+    # ALTERNATIVE ROUTES
+    # ========================================================
 
     st.markdown("## Compare alternative routes")
 
@@ -604,7 +672,9 @@ if result:
             recommended=(index == 0),
         )
 
-    # Route comparison table
+    # ========================================================
+    # ROUTE COMPARISON TABLE
+    # ========================================================
 
     comparison_rows = []
 
@@ -654,7 +724,9 @@ if result:
         hide_index=True,
     )
 
-    # Route snapping diagnostics
+    # ========================================================
+    # ROUTE SNAPPING DIAGNOSTICS
+    # ========================================================
 
     st.markdown("### Route snapping diagnostics")
 
@@ -680,6 +752,10 @@ if result:
             "Check the location result before relying on this route."
         )
 
+    # ========================================================
+    # DISCLAIMER
+    # ========================================================
+
     st.info(
         "Distance is calculated from road-network edge lengths. "
         "Travel time uses modelled speed and traffic-risk adjustments. "
@@ -688,9 +764,12 @@ if result:
         "before travelling."
     )
 
-else:
 
-    # Initial dashboard screen
+# ============================================================
+# INITIAL DASHBOARD SCREEN
+# ============================================================
+
+else:
 
     st.markdown(
         "## Plan a safer journey across Bengaluru"
@@ -719,9 +798,9 @@ else:
     )
 
 
-# ============================================================================
+# ============================================================
 # FOOTER
-# ============================================================================
+# ============================================================
 
 st.divider()
 
