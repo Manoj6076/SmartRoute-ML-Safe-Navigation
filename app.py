@@ -1,12 +1,12 @@
-# ============================================================
-# SmartRoute - Safe Navigation
-# Updated app.py
-# ============================================================
 
 from pathlib import Path
+import json
+import math
+
 import folium
+import pandas as pd
 import streamlit as st
-import streamlit.components.v1 as components
+from streamlit_folium import st_folium
 
 from routing_engine import (
     geocode_location,
@@ -14,810 +14,421 @@ from routing_engine import (
     find_route_candidates,
 )
 
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
 
-# ============================================================
-# PAGE CONFIG
-# ============================================================
+APP_DIR = Path(__file__).resolve().parent
+DATA_DIR = APP_DIR / "data"
+ROUTES_PATH = DATA_DIR / "routes.json"
 
 st.set_page_config(
-    page_title="SmartRoute - Safe Navigation",
-    page_icon="🚗",
+    page_title="SmartRoute | Safe Route Recommendation",
+    page_icon="🛣️",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
+# ============================================================================
+# STYLE
+# ============================================================================
 
-# ============================================================
-# CSS
-# ============================================================
+st.markdown("""
+<style>
+.main-title {
+    font-size: 2.35rem;
+    font-weight: 800;
+    margin-bottom: 0.1rem;
+}
+.subtitle {
+    color: #8b949e;
+    font-size: 1rem;
+    margin-bottom: 1rem;
+}
+.metric-card {
+    padding: 14px;
+    border: 1px solid rgba(128,128,128,.35);
+    border-radius: 12px;
+    min-height: 105px;
+}
+.route-card {
+    padding: 15px;
+    border: 1px solid rgba(128,128,128,.35);
+    border-radius: 12px;
+    margin-bottom: 12px;
+}
+.small-note {
+    color: #8b949e;
+    font-size: .83rem;
+}
+</style>
+""", unsafe_allow_html=True)
 
 st.markdown(
-    """
-    <style>
-    .main {
-        padding-top: 1rem;
-    }
-
-    .stButton > button {
-        border-radius: 8px;
-        font-weight: 600;
-    }
-
-    .route-card {
-        padding: 16px;
-        border-radius: 12px;
-        border: 1px solid #d9d9d9;
-        margin-bottom: 12px;
-        background-color: white;
-    }
-
-    .map-title {
-        font-size: 24px;
-        font-weight: 700;
-        margin-bottom: 10px;
-    }
-    </style>
-    """,
+    '<div class="main-title">🛣️ SmartRoute</div>',
     unsafe_allow_html=True,
 )
 
+st.markdown(
+    '<div class="subtitle">'
+    'Machine Learning-Based Multi-Factor Safe Route Recommendation'
+    '</div>',
+    unsafe_allow_html=True,
+)
 
-# ============================================================
-# CONSTANTS
-# ============================================================
+st.caption(
+    "Bengaluru road routing prototype | Distance, road health, "
+    "time-aware safety and risk-based recommendations"
+)
 
-APP_DIR = Path(__file__).resolve().parent
-DATA_DIR = APP_DIR / "data"
+st.divider()
 
-BENGALURU_CENTER = [
-    12.9716,
-    77.5946,
-]
+# ============================================================================
+# LOAD ROUTING NETWORK ONCE PER APP PROCESS
+# ============================================================================
 
-COMMON_LOCATIONS = [
-    "Majestic",
-    "Indiranagar",
-    "Koramangala",
-    "Whitefield",
-    "Electronic City",
-    "MG Road",
-    "Marathahalli",
-    "Bellandur",
-    "HSR Layout",
-    "BTM Layout",
-    "Hebbal",
-    "Yelahanka",
-    "KR Puram",
-    "Bengaluru Airport",
-]
+@st.cache_resource(show_spinner="Loading Bengaluru road network...")
+def get_routing_network(data_directory):
+    return load_routing_data(Path(data_directory))
 
 
-# ============================================================
-# SESSION STATE
-# ============================================================
+# ============================================================================
+# CACHED GEOCODING
+# ============================================================================
 
-if "source_query" not in st.session_state:
-    st.session_state.source_query = ""
+@st.cache_data(ttl=86400, show_spinner=False)
+def cached_geocode_location(query):
+    """
+    Cache successful location lookups for 24 hours.
 
-if "destination_query" not in st.session_state:
-    st.session_state.destination_query = ""
-
-if "period" not in st.session_state:
-    st.session_state.period = "Daytime"
-
-if "routes" not in st.session_state:
-    st.session_state.routes = None
-
-if "source_location" not in st.session_state:
-    st.session_state.source_location = None
-
-if "destination_location" not in st.session_state:
-    st.session_state.destination_location = None
+    The actual geocoding is handled by routing_engine.py,
+    which uses Nominatim with Photon as a backup.
+    """
+    return geocode_location(query.strip())
 
 
-# ============================================================
-# HELPER FUNCTIONS
-# ============================================================
+# ============================================================================
+# HELPERS
+# ============================================================================
 
 def format_number(value, decimals=1):
-    """
-    Safe number formatter.
-    Avoids the previous f-string syntax problem.
-    """
     try:
-        number = float(value)
-        return format(number, ",." + str(decimals) + "f")
+        return f"{float(value):,.{decimals}f}"
     except (TypeError, ValueError):
         return "N/A"
 
 
-def safe_float(value, default=0.0):
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return default
+def format_pct(value):
+    return f"{format_number(value)}%"
 
 
-def route_value(route, key, default=None):
+def load_example_routes():
+    """Load existing route examples without requiring them for dynamic routing."""
 
-    if isinstance(route, dict):
-        return route.get(key, default)
-
-    try:
-        return getattr(route, key, default)
-    except Exception:
-        return default
-
-
-def normalize_coordinates(coordinates):
-
-    if not coordinates:
+    if not ROUTES_PATH.exists():
         return []
 
-    output = []
+    try:
+        with open(ROUTES_PATH, encoding="utf-8") as file:
+            data = json.load(file)
 
-    for point in coordinates:
+        if isinstance(data, list):
+            return data
 
-        try:
+        if isinstance(data, dict):
+            routes = data.get("routes", [])
+            return routes if isinstance(routes, list) else []
 
-            if isinstance(point, dict):
+    except (OSError, ValueError):
+        return []
 
-                lat = point.get("lat")
-
-                if lat is None:
-                    lat = point.get("latitude")
-
-                lon = point.get("lon")
-
-                if lon is None:
-                    lon = point.get("longitude")
-
-                if lat is not None and lon is not None:
-                    output.append(
-                        [
-                            float(lat),
-                            float(lon),
-                        ]
-                    )
-
-            elif isinstance(point, (list, tuple)):
-
-                if len(point) >= 2:
-                    output.append(
-                        [
-                            float(point[0]),
-                            float(point[1]),
-                        ]
-                    )
-
-        except Exception:
-            continue
-
-    return output
+    return []
 
 
-def route_color(rank):
+def make_route_map(routes, source, destination):
+    """Build an interactive Folium map using calculated route paths."""
 
-    if rank == 1:
-        return "green"
+    center = [
+        (source["lat"] + destination["lat"]) / 2,
+        (source["lon"] + destination["lon"]) / 2,
+    ]
 
-    if rank == 2:
-        return "orange"
-
-    return "red"
-
-
-# ============================================================
-# CREATE OVERVIEW MAP
-# ============================================================
-
-def create_overview_map():
-
-    m = folium.Map(
-        location=BENGALURU_CENTER,
-        zoom_start=11,
-        control_scale=True,
-        tiles="OpenStreetMap",
-    )
-
-    folium.TileLayer(
-        tiles="CartoDB positron",
-        name="Light Map",
-        control=True,
-    ).add_to(m)
-
-    folium.Marker(
-        location=BENGALURU_CENTER,
-        tooltip="Bengaluru",
-        popup="SmartRoute Bengaluru",
-        icon=folium.Icon(
-            color="blue",
-            icon="info-sign",
-        ),
-    ).add_to(m)
-
-    folium.Circle(
-        location=BENGALURU_CENTER,
-        radius=12000,
-        color="blue",
-        fill=False,
-        tooltip="SmartRoute Bengaluru Coverage",
-    ).add_to(m)
-
-    folium.LayerControl().add_to(m)
-
-    return m
-
-
-# ============================================================
-# CREATE ROUTE MAP
-# ============================================================
-
-def create_route_map(
-    source,
-    destination,
-    routes,
-):
-
-    source_lat = float(source["lat"])
-    source_lon = float(source["lon"])
-
-    destination_lat = float(destination["lat"])
-    destination_lon = float(destination["lon"])
-
-    center_lat = (
-        source_lat + destination_lat
-    ) / 2
-
-    center_lon = (
-        source_lon + destination_lon
-    ) / 2
-
-    m = folium.Map(
-        location=[
-            center_lat,
-            center_lon,
-        ],
+    fmap = folium.Map(
+        location=center,
         zoom_start=12,
         control_scale=True,
         tiles="OpenStreetMap",
     )
 
-    # --------------------------------------------------------
-    # Alternative base map
-    # --------------------------------------------------------
+    palette = ["#16a34a", "#eab308", "#dc2626"]
 
-    folium.TileLayer(
-        tiles="CartoDB positron",
-        name="Light Map",
-        control=True,
-    ).add_to(m)
+    all_points = []
 
-    # --------------------------------------------------------
-    # SOURCE
-    # --------------------------------------------------------
+    for i, route in enumerate(routes):
 
-    folium.Marker(
-        location=[
-            source_lat,
-            source_lon,
-        ],
-        tooltip="📍 Source",
-        popup=folium.Popup(
-            "<b>Source</b><br>"
-            + str(
-                source.get(
-                    "address",
-                    source.get(
-                        "query",
-                        "Source",
-                    ),
-                )
-            ),
-            max_width=300,
-        ),
-        icon=folium.Icon(
-            color="blue",
-            icon="play",
-        ),
-    ).add_to(m)
-
-    # --------------------------------------------------------
-    # DESTINATION
-    # --------------------------------------------------------
-
-    folium.Marker(
-        location=[
-            destination_lat,
-            destination_lon,
-        ],
-        tooltip="🏁 Destination",
-        popup=folium.Popup(
-            "<b>Destination</b><br>"
-            + str(
-                destination.get(
-                    "address",
-                    destination.get(
-                        "query",
-                        "Destination",
-                    ),
-                )
-            ),
-            max_width=300,
-        ),
-        icon=folium.Icon(
-            color="red",
-            icon="flag",
-        ),
-    ).add_to(m)
-
-    # --------------------------------------------------------
-    # ROUTES
-    # --------------------------------------------------------
-
-    all_coordinates = []
-
-    for index, route in enumerate(routes):
-
-        rank = route_value(
-            route,
-            "rank",
-            index + 1,
-        )
-
-        try:
-            rank = int(rank)
-        except Exception:
-            rank = index + 1
-
-        coordinates = normalize_coordinates(
-            route_value(
-                route,
-                "coordinates",
-                [],
-            )
-        )
+        coordinates = route.get("coordinates", [])
 
         if not coordinates:
             continue
 
-        all_coordinates.extend(
-            coordinates
-        )
-
-        strategy = route_value(
-            route,
-            "strategy",
-            "Route",
-        )
-
-        distance = safe_float(
-            route_value(
-                route,
-                "distance_km",
-                0,
-            )
-        )
-
-        eta = safe_float(
-            route_value(
-                route,
-                "estimated_time_min",
-                0,
-            )
-        )
-
-        score = safe_float(
-            route_value(
-                route,
-                "overall_score",
-                0,
-            )
-        )
-
-        popup = (
-            "<div style='min-width:230px;'>"
-            "<h4>Route "
-            + str(rank)
-            + "</h4>"
-            "<b>Strategy:</b> "
-            + str(strategy)
-            + "<br>"
-            "<b>Distance:</b> "
-            + format_number(distance, 2)
-            + " km<br>"
-            "<b>Time:</b> "
-            + format_number(eta, 1)
-            + " min<br>"
-            "<b>Safety Score:</b> "
-            + format_number(score, 1)
-            + "</div>"
-        )
+        color = palette[min(i, len(palette) - 1)]
 
         folium.PolyLine(
             locations=coordinates,
-            color=route_color(rank),
-            weight=8 if rank == 1 else 5,
-            opacity=0.9,
+            color=color,
+            weight=7 if i == 0 else 5,
+            opacity=0.88,
             tooltip=(
-                "Route "
-                + str(rank)
-                + " - "
-                + str(strategy)
+                f"Route {i + 1}: "
+                f"{route.get('strategy', 'Alternative')} | "
+                f"{format_number(route.get('distance_km'))} km | "
+                f"{format_number(route.get('estimated_time_min'))} min"
             ),
-            popup=folium.Popup(
-                popup,
-                max_width=350,
-            ),
-        ).add_to(m)
+        ).add_to(fmap)
 
-    # --------------------------------------------------------
-    # FIT MAP
-    # --------------------------------------------------------
+        all_points.extend(coordinates)
 
-    if all_coordinates:
+    # Source marker
 
-        m.fit_bounds(
-            all_coordinates,
-            padding=(30, 30),
+    folium.Marker(
+        [source["lat"], source["lon"]],
+        tooltip="Source: " + source["query"],
+        popup=folium.Popup(
+            "<b>START</b><br>" + source["address"],
+            max_width=320,
+        ),
+        icon=folium.Icon(
+            color="blue",
+            icon="play"
+        ),
+    ).add_to(fmap)
+
+    # Destination marker
+
+    folium.Marker(
+        [destination["lat"], destination["lon"]],
+        tooltip="Destination: " + destination["query"],
+        popup=folium.Popup(
+            "<b>DESTINATION</b><br>" + destination["address"],
+            max_width=320,
+        ),
+        icon=folium.Icon(
+            color="darkred",
+            icon="flag"
+        ),
+    ).add_to(fmap)
+
+    if all_points:
+
+        all_points.extend([
+            [source["lat"], source["lon"]],
+            [destination["lat"], destination["lon"]],
+        ])
+
+        fmap.fit_bounds(
+            all_points,
+            padding=(30, 30)
         )
 
-    else:
-
-        m.fit_bounds(
-            [
-                [
-                    source_lat,
-                    source_lon,
-                ],
-                [
-                    destination_lat,
-                    destination_lon,
-                ],
-            ],
-            padding=(30, 30),
-        )
-
-    # --------------------------------------------------------
-    # LEGEND
-    # --------------------------------------------------------
+    # Map legend
 
     legend = """
     <div style="
         position: fixed;
-        bottom: 25px;
-        left: 25px;
+        bottom: 28px;
+        left: 24px;
         z-index: 9999;
         background: white;
-        padding: 12px;
-        border: 2px solid #777;
+        color: #111;
+        padding: 12px 15px;
+        border: 1px solid #bbb;
         border-radius: 8px;
         font-size: 13px;
-        box-shadow: 0px 2px 8px rgba(0,0,0,0.25);
-    ">
-        <b>SmartRoute</b><br>
-        <span style="color:green;">━━</span>
-        Recommended Route<br>
-        <span style="color:orange;">━━</span>
-        Alternative Route<br>
-        <span style="color:red;">━━</span>
-        Higher-Risk Route<br>
-        🔵 Source<br>
-        🔴 Destination
+        line-height: 1.8;">
+        <b>SMARTROUTE — ROUTE LEGEND</b><br>
+        <span style="color:#16a34a">━━</span> Recommended route<br>
+        <span style="color:#eab308">━━</span> Alternative route 2<br>
+        <span style="color:#dc2626">━━</span> Alternative route 3<br>
+        <span style="color:#2563eb">●</span> Source<br>
+        <span style="color:#991b1b">●</span> Destination
     </div>
     """
 
-    m.get_root().html.add_child(
+    fmap.get_root().html.add_child(
         folium.Element(legend)
     )
 
-    folium.LayerControl().add_to(m)
-
-    return m
+    return fmap
 
 
-# ============================================================
-# DISPLAY MAP
-# ============================================================
+def show_route_card(route, selected_period, recommended=False):
 
-def display_map(m, height=700):
-
-    """
-    IMPORTANT:
-    Render Folium directly as HTML instead of using
-    st_folium(). This avoids the blank-map rendering
-    problem in Streamlit deployments.
-    """
-
-    map_html = m.get_root().render()
-
-    components.html(
-        map_html,
-        height=height,
-        scrolling=False,
+    heading = (
+        "Recommended route"
+        if recommended
+        else f"Alternative route {route.get('rank', '')}"
     )
 
-
-# ============================================================
-# LOAD ROUTING NETWORK
-# ============================================================
-
-@st.cache_resource
-def get_network():
-
-    return load_routing_data(
-        str(DATA_DIR)
+    st.markdown(
+        '<div class="route-card">',
+        unsafe_allow_html=True
     )
 
+    st.markdown(
+        f"### {heading} — {route.get('strategy', 'Route')}"
+    )
 
-# ============================================================
-# HEADER
-# ============================================================
+    c1, c2, c3 = st.columns(3)
 
-st.title(
-    "🚗 SmartRoute"
-)
+    c1.metric(
+        "Distance",
+        f"{format_number(route.get('distance_km'))} km",
+    )
 
-st.subheader(
-    "ML-Assisted Safe Navigation for Bengaluru"
-)
+    c2.metric(
+        "Estimated time",
+        f"{format_number(route.get('estimated_time_min'))} min",
+    )
 
-st.write(
-    "Find safer routes using road condition, "
-    "traffic, safety and ML-based risk indicators."
-)
+    c3.metric(
+        "Journey score",
+        format_pct(route.get("overall_score")),
+    )
 
+    c4, c5, c6 = st.columns(3)
 
-# ============================================================
-# SIDEBAR
-# ============================================================
+    c4.metric(
+        "Road health",
+        format_pct(route.get("road_health_pct"))
+    )
 
-with st.sidebar:
+    c5.metric(
+        f"{selected_period} safety",
+        format_pct(route.get("selected_safety_pct")),
+    )
 
-    st.header(
-        "🔎 Plan Your Journey"
+    c6.metric(
+        "Traffic risk",
+        format_pct(route.get("traffic_risk_pct")),
     )
 
     st.caption(
-        "Enter locations or select a common Bengaluru location."
+        f"Road segments: {route.get('segment_count', 'N/A')} | "
+        f"ML risk proxy: {format_pct(route.get('ml_risk_proxy_pct'))}"
     )
 
-    with st.form(
-        "journey_form",
-        clear_on_submit=False,
-    ):
-
-        source_text = st.text_input(
-            "📍 Source",
-            value=st.session_state.source_query,
-            placeholder="Example: Majestic",
+    if recommended:
+        st.success(
+            "Highest overall score among the generated candidates."
         )
 
-        source_select = st.selectbox(
-            "Quick select source",
-            [
-                "— Type your own source —"
-            ]
-            + COMMON_LOCATIONS,
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
+# ============================================================================
+# SIDEBAR — JOURNEY INPUTS
+# ============================================================================
+
+with st.sidebar:
+
+    st.header("🔎 Plan Your Journey")
+
+    st.caption(
+        "Enter locations within supported Bengaluru coverage."
+    )
+
+    with st.form("dynamic_journey_form"):
+
+        source_query = st.text_input(
+            "Source location",
+            placeholder="e.g. Majestic",
         )
 
-        destination_text = st.text_input(
-            "🏁 Destination",
-            value=st.session_state.destination_query,
-            placeholder="Example: Whitefield",
+        destination_query = st.text_input(
+            "Destination",
+            placeholder="e.g. Whitefield",
         )
 
-        destination_select = st.selectbox(
-            "Quick select destination",
-            [
-                "— Type your own destination —"
-            ]
-            + COMMON_LOCATIONS,
-        )
-
-        period_select = st.radio(
-            "🕒 Travel period",
-            [
-                "☀️ Daytime",
-                "🌙 Nighttime",
-            ],
+        period = st.radio(
+            "Journey time",
+            ["Daytime", "Nighttime"],
             horizontal=True,
         )
 
-        search_button = st.form_submit_button(
-            "🚗 Find Safe Routes",
+        submitted = st.form_submit_button(
+            "Find Safe Routes",
             type="primary",
             use_container_width=True,
         )
 
+    st.divider()
 
-# ============================================================
-# SEARCH
-# ============================================================
+    st.caption("Example locations")
 
-if search_button:
+    st.write(
+        "Majestic, Indiranagar, Koramangala, "
+        "Whitefield, Electronic City"
+    )
 
-    # --------------------------------------------------------
-    # SOURCE
-    # --------------------------------------------------------
+    st.caption(
+        "Location search uses Nominatim with Photon as a backup. "
+        "Internet access is required. Successful lookups are "
+        "cached for 24 hours."
+    )
 
-    if (
-        not source_text.strip()
-        and source_select
-        != "— Type your own source —"
-    ):
 
-        source_text = source_select
+# ============================================================================
+# CALCULATE ROUTES
+# ============================================================================
 
-    # --------------------------------------------------------
-    # DESTINATION
-    # --------------------------------------------------------
+if submitted:
 
-    if (
-        not destination_text.strip()
-        and destination_select
-        != "— Type your own destination —"
-    ):
+    # Clear previous result before starting a new search.
 
-        destination_text = destination_select
+    st.session_state.pop(
+        "smartroute_result",
+        None
+    )
 
-    # --------------------------------------------------------
-    # PERIOD
-    # --------------------------------------------------------
+    if not source_query.strip() or not destination_query.strip():
 
-    if period_select.startswith("☀️"):
-        period = "Daytime"
+        st.error(
+            "Enter both a source and a destination."
+        )
+
+    elif source_query.strip().lower() == destination_query.strip().lower():
+
+        st.error(
+            "Source and destination cannot be the same."
+        )
+
     else:
-        period = "Nighttime"
-
-    # --------------------------------------------------------
-    # VALIDATION
-    # --------------------------------------------------------
-
-    if not source_text.strip():
-
-        st.error(
-            "Please enter or select a source."
-        )
-
-        st.stop()
-
-    if not destination_text.strip():
-
-        st.error(
-            "Please enter or select a destination."
-        )
-
-        st.stop()
-
-    # --------------------------------------------------------
-    # SAVE INPUT
-    # --------------------------------------------------------
-
-    st.session_state.source_query = (
-        source_text
-    )
-
-    st.session_state.destination_query = (
-        destination_text
-    )
-
-    st.session_state.period = period
-
-    # --------------------------------------------------------
-    # GEOCODE SOURCE
-    # --------------------------------------------------------
-
-    with st.spinner(
-        "Finding source location..."
-    ):
 
         try:
 
-            source_location = (
-                geocode_location(
-                    source_text
+            with st.spinner(
+                "Resolving locations and calculating routes..."
+            ):
+
+                # Resolve source and destination.
+
+                source_location = cached_geocode_location(
+                    source_query
                 )
-            )
 
-        except Exception as error:
-
-            st.error(
-                "Source geocoding failed: "
-                + str(error)
-            )
-
-            st.stop()
-
-    if not source_location:
-
-        st.error(
-            "Could not find source location."
-        )
-
-        st.stop()
-
-    # --------------------------------------------------------
-    # GEOCODE DESTINATION
-    # --------------------------------------------------------
-
-    with st.spinner(
-        "Finding destination location..."
-    ):
-
-        try:
-
-            destination_location = (
-                geocode_location(
-                    destination_text
+                destination_location = cached_geocode_location(
+                    destination_query
                 )
-            )
 
-        except Exception as error:
+                # Load graph and coordinate index.
 
-            st.error(
-                "Destination geocoding failed: "
-                + str(error)
-            )
+                graph, node_coords, node_index = get_routing_network(
+                    str(DATA_DIR)
+                )
 
-            st.stop()
+                # Generate actual road-network routes.
 
-    if not destination_location:
-
-        st.error(
-            "Could not find destination location."
-        )
-
-        st.stop()
-
-    # --------------------------------------------------------
-    # SAVE LOCATIONS
-    # --------------------------------------------------------
-
-    st.session_state.source_location = (
-        source_location
-    )
-
-    st.session_state.destination_location = (
-        destination_location
-    )
-
-    # --------------------------------------------------------
-    # LOAD NETWORK
-    # --------------------------------------------------------
-
-    with st.spinner(
-        "Loading SmartRoute network..."
-    ):
-
-        try:
-
-            graph, node_coords, node_index = (
-                get_network()
-            )
-
-        except Exception as error:
-
-            st.error(
-                "Could not load routing network."
-            )
-
-            st.exception(error)
-
-            st.stop()
-
-    # --------------------------------------------------------
-    # CALCULATE ROUTES
-    # --------------------------------------------------------
-
-    with st.spinner(
-        "Calculating safe route alternatives..."
-    ):
-
-        try:
-
-            calculated_routes = (
-                find_route_candidates(
+                calculated_routes = find_route_candidates(
                     graph=graph,
                     node_coords=node_coords,
                     node_index=node_index,
@@ -826,473 +437,295 @@ if search_button:
                     period=period,
                     max_routes=3,
                 )
-            )
 
-        except Exception as error:
+                # Save successful results.
+
+                st.session_state["smartroute_result"] = {
+                    "source": source_location,
+                    "destination": destination_location,
+                    "period": period,
+                    "routes": calculated_routes,
+                }
+
+        except ValueError as exc:
 
             st.error(
-                "Route calculation failed."
+                f"Invalid location or route: {exc}"
             )
 
-            st.exception(error)
+            st.info(
+                "Check the spelling of both locations and "
+                "select locations within Bengaluru."
+            )
 
-            st.stop()
+        except FileNotFoundError as exc:
 
-    st.session_state.routes = (
-        calculated_routes
-    )
+            st.error(
+                f"Routing dataset error: {exc}"
+            )
 
-    st.rerun()
+            st.info(
+                "Check that data/nodes.csv.gz and "
+                "data/edges.csv.gz exist in your project."
+            )
+
+        except Exception as exc:
+
+            st.error(
+                f"Unable to calculate routes: {exc}"
+            )
+
+            st.info(
+                "Check your internet connection, geocoding "
+                "services, and road-network connectivity."
+            )
 
 
-# ============================================================
-# CURRENT DATA
-# ============================================================
+# ============================================================================
+# DISPLAY SAVED RESULT
+# ============================================================================
 
-routes = st.session_state.routes
-
-source_location = (
-    st.session_state.source_location
+result = st.session_state.get(
+    "smartroute_result"
 )
 
-destination_location = (
-    st.session_state.destination_location
-)
+if result:
 
-
-# ============================================================
-# MAP
-# ============================================================
-
-st.markdown("---")
-
-st.header(
-    "🗺️ Interactive Route Map"
-)
-
-if (
-    routes
-    and source_location
-    and destination_location
-):
+    source = result["source"]
+    destination = result["destination"]
+    selected_period = result["period"]
+    routes = result["routes"]
 
     st.success(
-        "Routes calculated for "
-        + st.session_state.period
-        + "."
+        f"Calculated {len(routes)} route candidate(s) "
+        f"for {selected_period.lower()} travel."
     )
 
-    route_map = create_route_map(
-        source_location,
-        destination_location,
+    # Location details
+
+    left, right = st.columns(2)
+
+    with left:
+
+        st.markdown("**SOURCE**")
+
+        st.write(source["address"])
+
+    with right:
+
+        st.markdown("**DESTINATION**")
+
+        st.write(destination["address"])
+
+    # Provider details
+
+    st.caption(
+        f"Source provider: "
+        f"{source.get('geocoding_provider', 'Unknown')} | "
+        f"Destination provider: "
+        f"{destination.get('geocoding_provider', 'Unknown')}"
+    )
+
+    st.caption(
+        "Routes are snapped to the nearest road-network nodes. "
+        "The snap distances are reported for transparency."
+    )
+
+    first = routes[0]
+
+    # Recommended route
+
+    st.markdown("## Recommended route")
+
+    top1, top2, top3, top4 = st.columns(4)
+
+    top1.metric(
+        "Distance",
+        f"{format_number(first.get('distance_km'))} km",
+    )
+
+    top2.metric(
+        "Estimated travel time",
+        f"{format_number(first.get('estimated_time_min'))} min",
+    )
+
+    top3.metric(
+        "Road health",
+        format_pct(first.get("road_health_pct")),
+    )
+
+    top4.metric(
+        "Safety",
+        format_pct(first.get("selected_safety_pct")),
+    )
+
+    st.metric(
+        "Journey Confidence / Overall Score",
+        format_pct(first.get("overall_score")),
+        help=(
+            "Weighted route-ranking score. It is not a calibrated "
+            "probability or a guarantee of journey safety."
+        ),
+    )
+
+    # Route map
+
+    st.markdown("## Bengaluru route map")
+
+    st.caption(
+        "Green indicates the highest-ranked candidate, yellow the "
+        "second, and red the third. These colors distinguish routes; "
+        "they do not represent live road conditions."
+    )
+
+    fmap = make_route_map(
         routes,
+        source,
+        destination
     )
 
-    # IMPORTANT:
-    # Direct HTML rendering replaces st_folium.
-    display_map(
-        route_map,
-        height=700,
+    st_folium(
+        fmap,
+        height=650,
+        use_container_width=True,
+        returned_objects=[],
+        key="smartroute_dynamic_map",
+    )
+
+    # Alternative route cards
+
+    st.markdown("## Compare alternative routes")
+
+    for index, route in enumerate(routes):
+
+        show_route_card(
+            route,
+            selected_period,
+            recommended=(index == 0),
+        )
+
+    # Route comparison table
+
+    comparison_rows = []
+
+    for route in routes:
+
+        comparison_rows.append({
+
+            "Rank": route.get("rank"),
+
+            "Strategy": route.get("strategy"),
+
+            "Distance (km)": round(
+                route.get("distance_km", 0), 2
+            ),
+
+            "Time (min)": round(
+                route.get("estimated_time_min", 0), 1
+            ),
+
+            "Road health (%)": round(
+                route.get("road_health_pct", 0), 1
+            ),
+
+            "Safety (%)": round(
+                route.get("selected_safety_pct", 0), 1
+            ),
+
+            "Traffic risk (%)": round(
+                route.get("traffic_risk_pct", 0), 1
+            ),
+
+            "ML risk proxy (%)": round(
+                route.get("ml_risk_proxy_pct", 0), 1
+            ),
+
+            "Overall score": round(
+                route.get("overall_score", 0), 1
+            ),
+
+        })
+
+    st.markdown("### Route comparison table")
+
+    st.dataframe(
+        pd.DataFrame(comparison_rows),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    # Route snapping diagnostics
+
+    st.markdown("### Route snapping diagnostics")
+
+    d1, d2 = st.columns(2)
+
+    d1.metric(
+        "Source snap offset",
+        f"{format_number(first.get('source_snap_distance_km', 0), 3)} km",
+    )
+
+    d2.metric(
+        "Destination snap offset",
+        f"{format_number(first.get('destination_snap_distance_km', 0), 3)} km",
+    )
+
+    if (
+        first.get("source_snap_distance_km", 0) > 1.0
+        or first.get("destination_snap_distance_km", 0) > 1.0
+    ):
+
+        st.warning(
+            "A location is more than 1 km from its matched road node. "
+            "Check the location result before relying on this route."
+        )
+
+    st.info(
+        "Distance is calculated from road-network edge lengths. "
+        "Travel time uses modelled speed and traffic-risk adjustments. "
+        "Road health, safety, and ML risk are modelled features, "
+        "not verified live measurements. Confirm real-world conditions "
+        "before travelling."
     )
 
 else:
 
-    st.info(
-        "Select a source and destination from "
-        "the left sidebar to calculate routes."
+    # Initial dashboard screen
+
+    st.markdown(
+        "## Plan a safer journey across Bengaluru"
     )
-
-    overview_map = create_overview_map()
-
-    display_map(
-        overview_map,
-        height=600,
-    )
-
-
-# ============================================================
-# ROUTE RESULTS
-# ============================================================
-
-if routes:
-
-    st.markdown("---")
-
-    st.header(
-        "🛣️ Route Comparison"
-    )
-
-    for index, route in enumerate(routes):
-
-        rank = route_value(
-            route,
-            "rank",
-            index + 1,
-        )
-
-        strategy = route_value(
-            route,
-            "strategy",
-            "Route",
-        )
-
-        distance = safe_float(
-            route_value(
-                route,
-                "distance_km",
-                0,
-            )
-        )
-
-        eta = safe_float(
-            route_value(
-                route,
-                "estimated_time_min",
-                0,
-            )
-        )
-
-        score = safe_float(
-            route_value(
-                route,
-                "overall_score",
-                0,
-            )
-        )
-
-        st.markdown(
-            """
-            <div class="route-card">
-            <h4>
-            Route {rank} — {strategy}
-            </h4>
-
-            <b>Distance:</b>
-            {distance} km
-            &nbsp;&nbsp;&nbsp;
-
-            <b>Estimated Time:</b>
-            {eta} min
-            &nbsp;&nbsp;&nbsp;
-
-            <b>Safety Score:</b>
-            {score}
-            </div>
-            """.format(
-                rank=rank,
-                strategy=strategy,
-                distance=format_number(
-                    distance,
-                    2,
-                ),
-                eta=format_number(
-                    eta,
-                    1,
-                ),
-                score=format_number(
-                    score,
-                    1,
-                ),
-            ),
-            unsafe_allow_html=True,
-        )
-
-    # --------------------------------------------------------
-    # DETAILED ANALYSIS
-    # --------------------------------------------------------
-
-    st.markdown("---")
-
-    st.header(
-        "📊 Detailed Route Analysis"
-    )
-
-    route_names = []
-
-    for index, route in enumerate(routes):
-
-        rank = route_value(
-            route,
-            "rank",
-            index + 1,
-        )
-
-        strategy = route_value(
-            route,
-            "strategy",
-            "Route",
-        )
-
-        route_names.append(
-            "Route "
-            + str(rank)
-            + " — "
-            + str(strategy)
-        )
-
-    selected_index = st.selectbox(
-        "Select route",
-        range(len(routes)),
-        format_func=lambda x: route_names[x],
-    )
-
-    selected_route = routes[
-        selected_index
-    ]
-
-    distance = safe_float(
-        route_value(
-            selected_route,
-            "distance_km",
-            0,
-        )
-    )
-
-    eta = safe_float(
-        route_value(
-            selected_route,
-            "estimated_time_min",
-            0,
-        )
-    )
-
-    score = safe_float(
-        route_value(
-            selected_route,
-            "overall_score",
-            0,
-        )
-    )
-
-    road_health = safe_float(
-        route_value(
-            selected_route,
-            "road_health_pct",
-            0,
-        )
-    )
-
-    safety = safe_float(
-        route_value(
-            selected_route,
-            "selected_safety_pct",
-            0,
-        )
-    )
-
-    traffic = safe_float(
-        route_value(
-            selected_route,
-            "traffic_risk_pct",
-            0,
-        )
-    )
-
-    ml_risk = safe_float(
-        route_value(
-            selected_route,
-            "ml_risk_proxy_pct",
-            0,
-        )
-    )
-
-    strategy = route_value(
-        selected_route,
-        "strategy",
-        "Route",
-    )
-
-    c1, c2, c3, c4 = st.columns(4)
-
-    with c1:
-
-        st.metric(
-            "Distance",
-            format_number(
-                distance,
-                2,
-            )
-            + " km",
-        )
-
-    with c2:
-
-        st.metric(
-            "Estimated Time",
-            format_number(
-                eta,
-                1,
-            )
-            + " min",
-        )
-
-    with c3:
-
-        st.metric(
-            "Safety Score",
-            format_number(
-                score,
-                1,
-            ),
-        )
-
-    with c4:
-
-        st.metric(
-            "Road Health",
-            format_number(
-                road_health,
-                1,
-            )
-            + "%",
-        )
-
-    d1, d2, d3 = st.columns(3)
-
-    with d1:
-
-        st.write(
-            "**Route Strategy**"
-        )
-
-        st.write(
-            strategy
-        )
-
-    with d2:
-
-        st.write(
-            "**Traffic Risk**"
-        )
-
-        st.write(
-            format_number(
-                traffic,
-                1,
-            )
-            + "%"
-        )
-
-    with d3:
-
-        st.write(
-            "**ML Risk Proxy**"
-        )
-
-        st.write(
-            format_number(
-                ml_risk,
-                1,
-            )
-            + "%"
-        )
 
     st.write(
-        "**Selected Safety Indicator:** "
-        + format_number(
-            safety,
-            1,
-        )
-        + "%"
+        "Enter your starting point and destination in the sidebar, "
+        "choose daytime or nighttime, and select "
+        "**Find Safe Routes**."
+    )
+
+    st.markdown("""
+    **What this dashboard provides**
+
+    - Dynamic source and destination geocoding
+    - Alternative routes generated from the road network
+    - Distance and estimated travel time
+    - Road-health and time-aware safety scores
+    - Traffic and ML risk proxies
+    - An interactive map with distinct route colors
+    """)
+
+    st.warning(
+        "No journey has been calculated yet. Route metrics "
+        "appear after you submit valid locations."
     )
 
 
-# ============================================================
-# LOCATION INFORMATION
-# ============================================================
-
-if (
-    source_location
-    and destination_location
-):
-
-    st.markdown("---")
-
-    st.header(
-        "📍 Journey Information"
-    )
-
-    col1, col2 = st.columns(2)
-
-    with col1:
-
-        st.subheader(
-            "Source"
-        )
-
-        st.write(
-            source_location.get(
-                "address",
-                source_location.get(
-                    "query",
-                    st.session_state.source_query,
-                ),
-            )
-        )
-
-        st.write(
-            "Latitude: "
-            + format_number(
-                source_location.get(
-                    "lat"
-                ),
-                6,
-            )
-        )
-
-        st.write(
-            "Longitude: "
-            + format_number(
-                source_location.get(
-                    "lon"
-                ),
-                6,
-            )
-        )
-
-    with col2:
-
-        st.subheader(
-            "Destination"
-        )
-
-        st.write(
-            destination_location.get(
-                "address",
-                destination_location.get(
-                    "query",
-                    st.session_state.destination_query,
-                ),
-            )
-        )
-
-        st.write(
-            "Latitude: "
-            + format_number(
-                destination_location.get(
-                    "lat"
-                ),
-                6,
-            )
-        )
-
-        st.write(
-            "Longitude: "
-            + format_number(
-                destination_location.get(
-                    "lon"
-                ),
-                6,
-            )
-        )
-
-
-# ============================================================
+# ============================================================================
 # FOOTER
-# ============================================================
+# ============================================================================
 
-st.markdown("---")
+st.divider()
 
 st.caption(
-    "SmartRoute • ML-Assisted Safe Navigation • Bengaluru"
+    "SmartRoute | M.Tech research prototype | "
+    "Modelled risk estimates are not a substitute for live navigation."
 )
