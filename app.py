@@ -2,17 +2,12 @@
 from pathlib import Path
 import json
 import html
+import traceback
 
 import folium
 import pandas as pd
 import streamlit as st
 from streamlit_folium import st_folium
-
-from routing_engine import (
-    geocode_location,
-    load_routing_data,
-    find_route_candidates,
-)
 
 # ============================================================================
 # CONFIGURATION
@@ -28,6 +23,28 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+# Import the routing engine only after Streamlit is configured.
+# If the deployed module is stale, malformed, or missing a dependency,
+# display the real exception instead of Streamlit's shortened traceback.
+try:
+    import routing_engine
+
+    geocode_location = routing_engine.geocode_location
+    load_routing_data = routing_engine.load_routing_data
+    find_route_candidates = routing_engine.find_route_candidates
+
+except Exception as exc:
+    st.error("SmartRoute could not load routing_engine.py")
+    st.write("**Actual exception:**", f"{type(exc).__name__}: {exc}")
+    st.code(traceback.format_exc(), language="text")
+    st.info(
+        "Check that routing_engine.py is in the same GitHub folder as app.py, "
+        "that Streamlit is deploying the correct branch and main file, and "
+        "that requirements.txt installs all dependencies."
+    )
+    st.stop()
+
 
 # ============================================================================
 # STYLE
@@ -77,20 +94,3 @@ st.markdown(
 )
 
 st.caption(
-    "Bengaluru road routing prototype | Distance, road health, "
-    "time-aware safety and risk-based recommendations"
-)
-
-st.divider()
-
-# ============================================================================
-# LOAD ROUTING NETWORK ONCE PER APP PROCESS
-# ============================================================================
-
-@st.cache_resource(show_spinner="Loading Bengaluru road network...")
-def get_routing_network(data_directory):
-    return load_routing_data(Path(data_directory))
-
-
-# ============================================================================
-# CACHED GEOCODING
