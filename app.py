@@ -93,4 +93,4 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-st.caption(
+st.caption("Bengaluru road routing prototype | Distance, road health, time-aware safety and risk-based recommendations")
