@@ -89,8 +89,8 @@ def geocode_location(query):
     search_query = f"{query}, Bengaluru, Karnataka, India"
     errors = []
 
-    providers = [
-        (
-            "Nominatim",
-            Nominatim(
-                user_agent="SmartRouteSafeNavigation/2.1",
+    # Build providers separately. This simpler form also makes the
+    # parentheses unambiguous in GitHub/Streamlit deployments.
+    providers = []
+
+    try:
